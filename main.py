@@ -98,7 +98,7 @@ def fetch_and_chunk_logs(conninfo_or_params, lookback, max_chars):
                     "snapshot": str(row["snapshot"]),  # ensure JSON-friendly
                     "status": row["status"],
                     "stage": row["stage"],
-                    "filename": filename,
+                    "filename": filename.strip(),
                     "commit": row["commit"],
                     "branch": row["branch"],
                     "text": text_section

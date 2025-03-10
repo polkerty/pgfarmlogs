@@ -6,6 +6,8 @@ use Getopt::Long qw(GetOptions);
 use DBI;
 use JSON::PP;
 
+use Getopt::Long qw(:config no_ignore_case);
+
 # Magic delimiter, same as Python script
 my $MAGIC = "==~_~===-=-===~_~==";
 

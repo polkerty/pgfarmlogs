@@ -2,155 +2,141 @@
 use strict;
 use warnings;
 
-use Getopt::Long qw(GetOptions);
+use Getopt::Long qw(:config no_ignore_case);
 use DBI;
 use JSON::PP;
 
-use Getopt::Long qw(:config no_ignore_case);
-
-# Magic delimiter, same as Python script
+# Magic delimiter
 my $MAGIC = "==~_~===-=-===~_~==";
 
-# ------------------------------------------------------------------------------
-# chunk_log: Splits one large log string into an array of (filename, text_chunk).
-# Mirroring the Python logic:
-#   - The first chunk is labeled "head"
-#   - Each subsequent chunk is preceded by <MAGIC>filename<MAGIC>
-# ------------------------------------------------------------------------------
 sub chunk_log {
     my ($log_text, $magic) = @_;
-    my @chunks = ();
+    my @chunks;
     my $current_filename = "head";
     my $pos = 0;
 
     while (1) {
         my $next_magic = index($log_text, $magic, $pos);
         if ($next_magic == -1) {
-            # No more magic; everything from $pos to end is last chunk
-            my $text_chunk = substr($log_text, $pos);
-            push @chunks, [$current_filename, $text_chunk];
+            push @chunks, [$current_filename, substr($log_text, $pos)];
             last;
         }
-        # The text before 'next_magic' is the chunk for the current filename
-        my $text_chunk = substr($log_text, $pos, $next_magic - $pos);
-        push @chunks, [$current_filename, $text_chunk];
-
-        # Move past the magic delimiter
+        push @chunks, [$current_filename, substr($log_text, $pos, $next_magic - $pos)];
         $pos = $next_magic + length($magic);
 
-        # Now read until the *next* magic to get the next filename
         my $next_magic2 = index($log_text, $magic, $pos);
         if ($next_magic2 == -1) {
-            # If we never find the second magic, treat the rest as filename
             $current_filename = substr($log_text, $pos);
-            # There's no text chunk after that, so we're done
             last;
         }
         $current_filename = substr($log_text, $pos, $next_magic2 - $pos);
-
-        # Move 'pos' past this second magic
         $pos = $next_magic2 + length($magic);
     }
 
-    return @chunks;  # array of arrayrefs: [ filename, text_chunk ]
+    return @chunks;
 }
 
-# ------------------------------------------------------------------------------
-# fetch_and_chunk_logs: Connect to Postgres, query rows, chunk their logs, return
-# an array of parsed results. Each result is a hashref suitable for JSON output.
-# ------------------------------------------------------------------------------
 sub fetch_and_chunk_logs {
     my ($conninfo_or_params, $lookback, $max_chars) = @_;
 
-    # Connect to Postgres
+    # Connect with AutoCommit => 0, so we can DECLARE a cursor in a transaction
     my $dbh;
     if (ref($conninfo_or_params) eq 'HASH') {
-        # We have a hash of connection params
         $dbh = DBI->connect(
             "dbi:Pg:dbname=$conninfo_or_params->{dbname};host=$conninfo_or_params->{host};port=$conninfo_or_params->{port}",
             $conninfo_or_params->{user},
             $conninfo_or_params->{password},
             {
-                AutoCommit => 1,
+                AutoCommit => 0,
                 RaiseError => 1,
                 PrintError => 0,
             }
         );
     } else {
-        # We have a conninfo string
-        # DBD::Pg can parse some connection info from "dbi:Pg:$conninfo"
-        # but it's simpler to do "dbi:Pg:$conninfo" directly.
         my $conn_str = "dbi:Pg:$conninfo_or_params";
         $dbh = DBI->connect(
             $conn_str,
-            undef,  # user
-            undef,  # password
+            undef,
+            undef,
             {
-                AutoCommit => 1,
+                AutoCommit => 0,
                 RaiseError => 1,
                 PrintError => 0,
             }
         );
     }
 
-    # Prepare and execute query
-    my $sql = qq{
-        SELECT
-            sysname,
-            snapshot,
-            status,
-            stage,
-            log,
-            branch,
-            git_head_ref AS commit
-        FROM build_status
-        WHERE stage != 'OK'
-          AND build_status.report_time IS NOT NULL
-          AND snapshot > current_date - ?::interval
-        ORDER BY snapshot ASC
-    };
+    # Prepare a DECLARE CURSOR statement
+    my $cursor_name = 'log_stream_cursor';
+    my $quoted_lookback = $dbh->quote($lookback);  # e.g. '6 months'
+    # We'll produce something like:   snapshot > current_date - '6 months'::interval
+    my $interval_expr = $quoted_lookback . '::interval';
 
-    my $sth = $dbh->prepare($sql);
-    $sth->execute($lookback);
+    my $declare_sql = <<"SQL";
+DECLARE $cursor_name NO SCROLL CURSOR FOR
+    SELECT
+        sysname,
+        snapshot,
+        status,
+        stage,
+        log,
+        branch,
+        git_head_ref AS commit
+    FROM build_status
+    WHERE stage != 'OK'
+      AND build_status.report_time IS NOT NULL
+      AND snapshot > current_date - $interval_expr
+    ORDER BY snapshot ASC
+SQL
+
+    # Declare the cursor
+    $dbh->do($declare_sql);
 
     my @results;
+    my $batch_size = 100;
 
-    # Fetch row by row (should stream rather than read everything at once)
-    while (my $row = $sth->fetchrow_hashref) {
-        my $log_text = defined $row->{log} ? $row->{log} : "";
+    while (1) {
+        # FETCH <batch_size> rows from the cursor
+        my $fetch_sql = "FETCH $batch_size FROM $cursor_name";
+        my $fetch_sth = $dbh->prepare($fetch_sql);
+        $fetch_sth->execute();
 
-        # Break out the log into chunks
-        my @pieces = chunk_log($log_text, $MAGIC);
-        foreach my $piece (@pieces) {
-            my ($filename, $text_section) = @$piece;
+        my $row_count = 0;
+        while (my $row = $fetch_sth->fetchrow_hashref) {
+            $row_count++;
+            my $log_text = defined $row->{log} ? $row->{log} : "";
 
-            # Keep only the last $max_chars characters
-            if (length($text_section) > $max_chars) {
-                $text_section = substr($text_section, -1 * $max_chars);
+            my @pieces = chunk_log($log_text, $MAGIC);
+            foreach my $piece (@pieces) {
+                my ($filename, $text_section) = @$piece;
+                if (length($text_section) > $max_chars) {
+                    $text_section = substr($text_section, -$max_chars);
+                }
+                push @results, {
+                    sysname  => $row->{sysname},
+                    snapshot => "$row->{snapshot}", # stringified
+                    status   => $row->{status},
+                    stage    => $row->{stage},
+                    filename => $filename =~ s/^\s+|\s+$//gr,
+                    commit   => $row->{commit},
+                    branch   => $row->{branch},
+                    text     => $text_section,
+                };
             }
-
-            push @results, {
-                sysname  => $row->{sysname},
-                snapshot => "$row->{snapshot}", # stringified
-                status   => $row->{status},
-                stage    => $row->{stage},
-                filename => $filename =~ s/^\s+|\s+$//gr, # strip spaces
-                commit   => $row->{commit},
-                branch   => $row->{branch},
-                text     => $text_section,
-            };
         }
+
+        $fetch_sth->finish();
+        last if $row_count == 0;
     }
 
-    $sth->finish;
+    # Close cursor and commit
+    $dbh->do("CLOSE $cursor_name");
+    $dbh->do("COMMIT");
     $dbh->disconnect;
 
     return \@results;
 }
 
-# ------------------------------------------------------------------------------
-# prompt_for_password
-# ------------------------------------------------------------------------------
 sub prompt_for_password {
     print "Password: ";
     my $pw = <STDIN>;
@@ -158,71 +144,53 @@ sub prompt_for_password {
     return $pw;
 }
 
-# ------------------------------------------------------------------------------
-# main: parse CLI args (psql-like), figure out password logic, call fetch logic
-# ------------------------------------------------------------------------------
 sub main {
     my %args;
     GetOptions(
-        # psql-style short options
-        "h|host=s"    => \$args{host},
-        "p|port=i"    => \$args{port},
-        "d|dbname=s"  => \$args{dbname},
-        "U|user=s"    => \$args{user},
-
-        # approximate psql -w / -W
-        "w|no-password" => \$args{no_password},
-        "W|password"    => \$args{password},
-
-        # optional full connection info
-        "conninfo=s"  => \$args{conninfo},
-
-        # additional filter params
-        "lookback=s"  => \$args{lookback},
-        "max-chars=i" => \$args{max_chars},
-
-        # help
-        "H|help"      => \$args{help},
+        "h|host=s"       => \$args{host},
+        "p|port=i"       => \$args{port},
+        "d|dbname=s"     => \$args{dbname},
+        "U|user=s"       => \$args{user},
+        "w|no-password"  => \$args{no_password},
+        "W|password"     => \$args{password},
+        "conninfo=s"     => \$args{conninfo},
+        "lookback=s"     => \$args{lookback},
+        "max-chars=i"    => \$args{max_chars},
+        "H|help"         => \$args{help},
     ) or die "Error in command line arguments\n";
 
     if ($args{help}) {
         print "Usage: $0 [options]\n";
-        print "  -h, --host=HOST         Database server host (default from \$PGHOST or 'localhost')\n";
-        print "  -p, --port=PORT         Database server port (default from \$PGPORT or 5432)\n";
-        print "  -d, --dbname=DBNAME     Database name (default from \$PGDATABASE or 'postgres')\n";
-        print "  -U, --user=USER         Database user (default from \$PGUSER or 'postgres')\n";
-        print "  -w, --no-password       Never prompt for password. (Sets empty password)\n";
-        print "  -W, --password          Prompt for password, ignoring \$PGPASSWORD.\n";
-        print "      --conninfo=STRING   Full libpq connection string (e.g. 'host=... port=... dbname=... user=...')\n";
-        print "      --lookback=PERIOD   PostgreSQL interval syntax (e.g. '2 days'); default '6 months'\n";
-        print "      --max-chars=NUM     Number of chars from end of each chunk; default 1000.\n";
-        print "  -H, --help              Show this help message.\n";
+        print "  -h, --host=HOST\n";
+        print "  -p, --port=PORT\n";
+        print "  -d, --dbname=DBNAME\n";
+        print "  -U, --user=USER\n";
+        print "  -w, --no-password\n";
+        print "  -W, --password\n";
+        print "      --conninfo=STRING\n";
+        print "      --lookback=PERIOD  (default '6 months')\n";
+        print "      --max-chars=NUM    (default 1000)\n";
+        print "  -H, --help\n";
         exit 0;
     }
 
-    # Default values (like python script)
-    my $host     = $args{host}     || $ENV{PGHOST}     || 'localhost';
-    my $port     = $args{port}     || $ENV{PGPORT}     || 5432;
-    my $dbname   = $args{dbname}   || $ENV{PGDATABASE} || 'postgres';
-    my $user     = $args{user}     || $ENV{PGUSER}     || 'postgres';
-    my $lookback = $args{lookback} || '6 months';
-    my $max_chars= defined $args{max_chars} ? $args{max_chars} : 1000;
+    my $host      = $args{host}     || $ENV{PGHOST}     || 'localhost';
+    my $port      = $args{port}     || $ENV{PGPORT}     || 5432;
+    my $dbname    = $args{dbname}   || $ENV{PGDATABASE} || 'postgres';
+    my $user      = $args{user}     || $ENV{PGUSER}     || 'postgres';
+    my $lookback  = $args{lookback} || '6 months';
+    my $max_chars = defined $args{max_chars} ? $args{max_chars} : 1000;
 
     my $conninfo_or_params;
     if ($args{conninfo}) {
-        # They provided a direct conninfo string
         $conninfo_or_params = $args{conninfo};
-
         if ($args{password}) {
             my $pw = prompt_for_password();
-            # Append or override password=... in the conninfo
             $conninfo_or_params .= " password='$pw'";
         } elsif ($args{no_password}) {
-            # Force empty password
             $conninfo_or_params .= " password=''";
         }
     } else {
-        # Build a connection params hash
         my $env_pass = $ENV{PGPASSWORD} || "";
         my $final_pass;
         if ($args{password}) {
@@ -242,10 +210,8 @@ sub main {
         };
     }
 
-    # Fetch and chunk
     my $results = fetch_and_chunk_logs($conninfo_or_params, $lookback, $max_chars);
 
-    # Convert to JSON (pretty print)
     my $json = JSON::PP->new->canonical->pretty;
     print $json->encode($results);
 }

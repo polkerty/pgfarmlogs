@@ -8,7 +8,7 @@ def run_jobs(fn, payloads, max_workers=5):
         try:
             return i, fn(args)
         except Exception as e:
-            print(f"Error processing payload {args}: {e}")
+            print(f"Error processing payload #{i}: {args}: {e}")
             return i, {"error": str(e)}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

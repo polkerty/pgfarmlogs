@@ -18,6 +18,10 @@ def get_data(filename, count=None):
     with open(filename, 'r') as f:
         data = json.load(f)
 
+    # can't generate embeddings for empty strings;
+    # just skip those files for now
+    data = [file for file in data if len(file['text'])]
+
     for i, file in enumerate(data):
         file['key'] = i 
     
@@ -53,6 +57,8 @@ def batch_files(data):
         running_token_count += tokens
 
     batches.append(batch) # flush the last batch
+
+    print(f"Generated {len(batches)} batches for {len(data)} files")
 
     return batches
 

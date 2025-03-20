@@ -9,16 +9,32 @@ def output(file, format):
     
     raise ValueError(f'Invalid output format {format}')
 
-def main(filename, outfile, format):
+NAME_TOKEN = '<NAME>'
+
+def main(filename, outfile_pattern, format):
+
+    if NAME_TOKEN not in outfile_pattern:
+        raise ValueError(f"Please include the token {NAME_TOKEN} in the output file pattern.")
+    
+    file_descriptors = {}
+
     # clear out file
-    with open(outfile, 'w') as fout:
-        fout.write('')
 
     with open(filename, 'r') as fin:
-        with open(outfile, 'a') as fout:
-            for file in fin:
-                data = json.loads(file)
-                fout.write(output(data, format))
+        for file in fin:
+            data = json.loads(file)
+            filename = data['filename'].split('/')[-1]
+            if filename not in file_descriptors:
+                outfile_name = outfile_pattern.replace(NAME_TOKEN, filename)
+                with open(outfile_name, 'w') as fout:
+                    fout.write('') # clear
+                file_descriptors[filename] = open(outfile_name, 'a')
+            
+            fout = file_descriptors[filename]
+            fout.write(output(data, format))
+    
+    for fout in file_descriptors.values():
+        fout.close()
 
 if __name__ == '__main__':
 

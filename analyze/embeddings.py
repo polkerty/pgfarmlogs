@@ -10,7 +10,7 @@ client = OpenAI()
 
 VERBOSE = False
 
-def get_data(filename, count=None):
+def get_data(filename, count=None, match_names=None):
 
     if VERBOSE:
         print(f"Loading file {filename} with limit {count}")
@@ -21,6 +21,9 @@ def get_data(filename, count=None):
     # can't generate embeddings for empty strings;
     # just skip those files for now
     data = [file for file in data if len(file['text'])]
+
+    if match_names:
+        data = [file for file in data if file['filename'].split('/')[-1] in match_names]
 
     for i, file in enumerate(data):
         file['key'] = i 
@@ -78,15 +81,21 @@ def batch_get_embeddings(batches):
     by_batch = run_jobs(get_embeddings, batches, 10)
     return by_batch
 
-def main(filename, out, count=None):
-    data = get_data(filename, count)
+def main(filename, out, count=None, match_names=None):
+    data = get_data(filename, count, match_names)
     batches = batch_files(data)
 
     # modifies files in place
     batch_get_embeddings(batches)
 
+    # clear file
     with open(out, 'w') as f:
-        json.dump(data, f)
+        f.write('')
+
+    # jsonl
+    with open(out, 'a') as f:
+        for file in data:
+            f.write(json.dumps(file) + '\n')
 
 if __name__ == '__main__':
 
@@ -97,13 +106,18 @@ if __name__ == '__main__':
     
     parser.add_argument('-f', '--filename')      
     parser.add_argument('-o', '--out')      
+    parser.add_argument('-n', '--match-names')      
     parser.add_argument('-c', '--count', type=int)      
     parser.add_argument('-v', '--verbose',
                         action='store_true')  
     
     args = parser.parse_args()
 
+    match_names = None
+    if args.match_names:
+        match_names = args.match_names.split(',')
+
     if args.verbose:
         VERBOSE = args.verbose
 
-    main(args.filename, args.out, args.count)
+    main(args.filename, args.out, args.count, match_names)

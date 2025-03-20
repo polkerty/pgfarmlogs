@@ -9,14 +9,33 @@ def output(file, format):
     
     raise ValueError(f'Invalid output format {format}')
 
+META_FIELDS = ['key', 'sysname', 'snapshot']
+def meta_output(file, format):
+
+    data = [file[field] for field in META_FIELDS ]
+    if format == 'tsv':
+        return '\t'.join(str(field) for field in data) + '\n'
+    
+    raise ValueError(f'Invalid output format {format}')
+
+def meta_header(format):
+    if format == 'tsv':
+        return '\t'.join(str(field) for field in META_FIELDS) + '\n'
+    
+    raise ValueError(f'Invalid output format {format}')
+
+
+
 NAME_TOKEN = '<NAME>'
+META_PREFIX = 'metadata-'
 
 def main(filename, outfile_pattern, format):
 
     if NAME_TOKEN not in outfile_pattern:
         raise ValueError(f"Please include the token {NAME_TOKEN} in the output file pattern.")
     
-    file_descriptors = {}
+    embed_handles = {}
+    meta_handles = {}
 
     # clear out file
 
@@ -24,17 +43,32 @@ def main(filename, outfile_pattern, format):
         for file in fin:
             data = json.loads(file)
             filename = data['filename'].split('/')[-1]
-            if filename not in file_descriptors:
+
+            # Emedding data
+            if filename not in embed_handles:
                 outfile_name = outfile_pattern.replace(NAME_TOKEN, filename)
                 with open(outfile_name, 'w') as fout:
                     fout.write('') # clear
-                file_descriptors[filename] = open(outfile_name, 'a')
+                embed_handles[filename] = open(outfile_name, 'a')
             
-            fout = file_descriptors[filename]
+            # Metada
+            if filename not in meta_handles:
+                outfile_name = outfile_pattern.replace(NAME_TOKEN, META_PREFIX + filename)
+                with open(outfile_name, 'w') as fout:
+                    fout.write(meta_header(format)) # clear
+                meta_handles[filename] = open(outfile_name, 'a')
+            
+            fout = embed_handles[filename]
             fout.write(output(data, format))
+
+            fout_m = meta_handles[filename]
+            fout_m.write(meta_output(data, format))
     
-    for fout in file_descriptors.values():
+    for fout in embed_handles.values():
         fout.close()
+
+    for fout_m in meta_handles.values():
+        fout_m.close()
 
 if __name__ == '__main__':
 

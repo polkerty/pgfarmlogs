@@ -9,12 +9,12 @@ def output(file, format):
     
     raise ValueError(f'Invalid output format {format}')
 
-META_FIELDS = ['key', 'sysname', 'snapshot']
+META_FIELDS = ['key', 'sysname', 'snapshot', 'text']
 def meta_output(file, format):
 
     data = [file[field] for field in META_FIELDS ]
     if format == 'tsv':
-        return '\t'.join(str(field) for field in data) + '\n'
+        return '\t'.join(str(field).replace('\n', '\\n').replace('\t','\\t') for field in data) + '\n'
     
     raise ValueError(f'Invalid output format {format}')
 
